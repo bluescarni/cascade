@@ -1184,7 +1184,7 @@ outcome sim::step()
     broad_phase_parallel();
 
     // Narrow phase collision detection.
-    narrow_phase_parallel();
+    //narrow_phase_parallel();
 
     // Data to determine and setup the outcome of the step.
     outcome oc = outcome::success;

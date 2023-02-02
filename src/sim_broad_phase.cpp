@@ -8,14 +8,25 @@
 
 #include <atomic>
 #include <cassert>
+#include <cmath>
+#include <optional>
+#include <stdexcept>
+#include <numeric>
 #include <initializer_list>
 #include <memory>
 #include <set>
 #include <utility>
 #include <vector>
 
+#include <boost/safe_numerics/safe_integer.hpp>
+#include <boost/numeric/conversion/cast.hpp>
+
+#include <fmt/core.h>
+
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/parallel_for.h>
+
+#include <heyoka/detail/dfloat.hpp>
 
 #include <cascade/detail/logging_impl.hpp>
 #include <cascade/detail/sim_data.hpp>
@@ -49,9 +60,23 @@ void sim::broad_phase_parallel()
 
     auto *logger = detail::get_logger();
 
-    // Fetch the number of particles and chunks from m_data.
+    // Cache a few quantities.
     const auto nparts = get_nparts();
     const auto nchunks = m_data->nchunks;
+    const auto order = m_data->s_ta.get_order();
+
+        if (!std::isfinite(m_conj_thresh * m_conj_thresh)) {
+        // LCOV_EXCL_START
+        throw std::invalid_argument(
+            fmt::format("A conjunction threshold of {} is too large and results in an overflow error", m_conj_thresh));
+        // LCOV_EXCL_STOP
+        }
+    
+    // Is conjunction detection activated globally?
+    const auto with_conj = (m_conj_thresh != 0);
+
+    // Reset the collision vector.
+    m_data->coll_vec.clear();
 
     // Global counter for the total number of AABBs collisions
     // across all chunks.
@@ -89,6 +114,26 @@ void sim::broad_phase_parallel()
             }
             auto &bp_data_cache = *bp_data_cache_ptr;
 
+            // Fetch a reference to the chunk-specific narrow-phase caches.
+            auto &np_cache_ptr = m_data->np_caches[chunk_idx];
+            // NOTE: the pointer will require initialisation the first time
+            // it is used.
+            if (!np_cache_ptr) {
+                np_cache_ptr = std::make_unique<typename decltype(m_data->np_caches)::value_type::element_type>();
+            }
+            auto &np_cache = *np_cache_ptr;
+
+            // Fetch a reference to the detected conjunctions vector
+            // for the current chunk and clear it out.
+            auto &cl_conj_vec = m_data->conj_vecs[chunk_idx];
+            cl_conj_vec.clear();
+
+            // The time coordinate, relative to init_time, of
+            // the chunk's begin/end.
+            const auto [c_begin, c_end] = m_data->get_chunk_begin_end(chunk_idx, m_ct);
+            const auto chunk_begin = heyoka::detail::dfloat<double>(c_begin);
+            const auto chunk_end = heyoka::detail::dfloat<double>(c_end);
+
             oneapi::tbb::parallel_for(oneapi::tbb::blocked_range<size_type>(0, nparts), [&](const auto &r2) {
                 // Fetch local data for broad phase collision detection.
                 std::unique_ptr<sim_data::bp_data> local_bp_data;
@@ -99,6 +144,38 @@ void sim::broad_phase_parallel()
 
                     local_bp_data = std::make_unique<sim_data::bp_data>();
                 }
+
+                // Fetch and setup local data for narrow-phase detection.
+                std::unique_ptr<sim_data::np_data> pcaches;
+
+                if (np_cache.try_pop(pcaches)) {
+#if !defined(NDEBUG)
+                    assert(pcaches);
+
+                    for (auto &v : pcaches->pbuffers) {
+                        assert(v.size() == order + 1u);
+                    }
+
+                    using safe_size_t = boost::safe_numerics::safe<decltype(pcaches->diff_input.size())>;
+                    assert(pcaches->diff_input.size() == (order + 1u) * safe_size_t(6));
+#endif
+                } else {
+                    SPDLOG_LOGGER_DEBUG(logger, "Creating new local polynomials for narrow phase collision detection");
+
+                    // Init pcaches.
+                    pcaches = std::make_unique<sim_data::np_data>();
+
+                    for (auto &v : pcaches->pbuffers) {
+                        v.resize(boost::numeric_cast<decltype(v.size())>(order + 1u));
+                    }
+
+                    using safe_size_t = boost::safe_numerics::safe<decltype(pcaches->diff_input.size())>;
+                    pcaches->diff_input.resize((order + 1u) * safe_size_t(6));
+                }
+
+                // Prepare the local conjunction vector.
+                auto &local_conj_vec = pcaches->local_conj_vec;
+                local_conj_vec.clear();
 
                 // Cache and clear the local list of collisions.
                 auto &local_bp = local_bp_data->bp;
@@ -181,7 +258,9 @@ void sim::broad_phase_parallel()
                                     const auto conj_active_i = m_data->conj_active[orig_i];
 
                                     if (coll_active_pidx || conj_active_pidx || coll_active_i || conj_active_i) {
+                                        // TODO remove.
                                         local_bp.emplace_back(orig_pidx, orig_i);
+                                        narrow_phase_pair(pcaches.get(),orig_pidx, orig_i,chunk_begin, chunk_end, logger );
                                     }
                                 }
                             } else {
@@ -193,6 +272,14 @@ void sim::broad_phase_parallel()
                         }
                     } while (!stack.empty());
                 }
+
+                                // Atomically merge the local conjunction vector into the chunk-specific one.
+                if (with_conj) {
+                    cl_conj_vec.grow_by(local_conj_vec.begin(), local_conj_vec.end());
+                }
+
+                // Put the polynomials back into the caches.
+                np_cache.push(std::move(pcaches));
 
                 // Atomically merge the local bp into the chunk-local one.
                 bp_cv.grow_by(local_bp.begin(), local_bp.end());
@@ -206,11 +293,50 @@ void sim::broad_phase_parallel()
         }
     });
 
+        // NOTE: this is used only for logging purposes.
+    std::optional<decltype(m_det_conj->size())> n_det_conjs;
+
+    if (with_conj) {
+        // If conjunction detection is active, we want to prepare
+        // the global conjunction vector for the new detected conjunctions
+        // which are currently stored in m_data->conj_vecs. The objective
+        // is to avoid reallocating in the step() function, where
+        // we need the noexcept guarantee.
+
+        // We begin by determining how many conjunctions were detected.
+        // NOTE: perhaps determining n_new_conj can be done in parallel
+        // earlier. We just need to take care of avoiding overflow somehow.
+        using safe_size_t = boost::safe_numerics::safe<decltype(m_det_conj->size())>;
+        const auto n_new_conj = std::accumulate(m_data->conj_vecs.begin(), m_data->conj_vecs.end(), safe_size_t(0),
+                                                [](const auto &acc, const auto &cur) { return acc + cur.size(); });
+
+        // Do we have enough storage in m_det_conj to store the new conjunctions?
+        if (m_det_conj->size() + n_new_conj > m_det_conj->capacity()) {
+            // m_det_conj cannot store the new conjunctions without reallocating.
+            // We thus prepare a new vector with twice the needed capacity.
+            std::vector<conjunction> new_det_conj;
+            new_det_conj.reserve(2u * (m_det_conj->size() + n_new_conj));
+
+            // Copy over the existing conjunctions.
+            new_det_conj.insert(new_det_conj.end(), m_det_conj->begin(), m_det_conj->end());
+
+            // Assign the new conjunction vector.
+            m_det_conj = std::make_shared<std::vector<conjunction>>(std::move(new_det_conj));
+        }
+
+        // Set the logging variable.
+        n_det_conjs.emplace(n_new_conj);
+    }
+
     logger->trace("Broad phase collision detection time: {}s", sw);
 
     logger->trace("Average number of AABB collisions per particle per chunk: {}",
                   static_cast<double>(tot_n_bp.load(std::memory_order::relaxed)) / static_cast<double>(nchunks)
                       / static_cast<double>(nparts));
+
+    if (n_det_conjs) {
+        logger->trace("Total number of conjunctions detected: {}", *n_det_conjs);
+    }
 
 #if !defined(NDEBUG)
     verify_broad_phase_parallel();

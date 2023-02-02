@@ -1022,4 +1022,371 @@ void sim::narrow_phase_parallel()
     }
 }
 
+// TODO note on pwrap, lint ignore, conj_thres2 check.
+void sim::narrow_phase_pair(void *pcaches_, size_type pi, size_type pj, const heyoka::detail::dfloat<double> &chunk_begin, const heyoka::detail::dfloat<double> &chunk_end,
+                            void *logger_)
+{
+    namespace stdex = std::experimental;
+    namespace hy = heyoka;
+
+    assert(pi != pj);
+
+    auto *logger = static_cast<decltype(detail::get_logger())>(logger_);
+    auto *pcaches = static_cast<sim_data::np_data *>(pcaches_);
+
+    // Cache a few quantities.
+    auto &[xi_temp, yi_temp, zi_temp, xj_temp, yj_temp, zj_temp, ss_diff, ss_diff_der, vxi_temp, vyi_temp, vzi_temp,
+           vxj_temp, vyj_temp, vzj_temp]
+        = pcaches->pbuffers;
+    auto &diff_input = pcaches->diff_input;
+    auto &wlist = pcaches->wlist;
+    auto &isol = pcaches->isol;
+    auto &r_iso_cache = pcaches->r_iso_cache;
+    auto &tmp_conj_vec = pcaches->tmp_conj_vec;
+    auto &local_conj_vec = pcaches->local_conj_vec;
+    const auto order = m_data->s_ta.get_order();
+        const auto pta_cfunc = m_data->pta_cfunc;
+    const auto pssdiff3_cfunc = m_data->pssdiff3_cfunc;
+    const auto fex_check = m_data->fex_check;
+    const auto rtscc = m_data->rtscc;
+    const auto pt1 = m_data->pt1;
+    const auto conj_thresh2 = m_conj_thresh * m_conj_thresh;
+    const auto init_time = m_data->time;
+
+    // Temporary polynomials used in the bisection loop.
+    using pwrap = sim_data::np_data::pwrap;
+    pwrap tmp1(r_iso_cache, order), tmp2(r_iso_cache, order), tmp(r_iso_cache, order);
+
+    // Get the activity flags.
+    const auto pi_coll_active = m_data->coll_active[pi];
+    const auto pi_conj_active = m_data->conj_active[pi];
+    const auto pj_coll_active = m_data->coll_active[pj];
+    const auto pj_conj_active = m_data->conj_active[pj];
+
+    assert(pi_coll_active || pj_coll_active || pi_conj_active || pj_conj_active);
+
+    // Is conjunction detection active for this pair of particles?
+    const auto pij_conj_active = pi_conj_active || pj_conj_active;
+
+    // Fetch a reference to the substep data
+    // for the two particles.
+    const auto &sd_i = m_data->s_data[pi];
+    const auto &sd_j = m_data->s_data[pj];
+
+    // Fetch views for reading the Taylor coefficients
+    // for the two particles.
+    using tc_size_t = decltype(sd_i.tcs.size());
+    stdex::mdspan tcs_i(sd_i.tcs.data(), stdex::extents<tc_size_t, stdex::dynamic_extent, 7u, stdex::dynamic_extent>(
+                                             sd_i.tcoords.size(), order + 1u));
+    stdex::mdspan tcs_j(sd_j.tcs.data(), stdex::extents<tc_size_t, stdex::dynamic_extent, 7u, stdex::dynamic_extent>(
+                                             sd_j.tcoords.size(), order + 1u));
+
+    // Fetch a view on the state vector in order to
+    // access the particles' sizes.
+    stdex::mdspan sv(std::as_const(m_state)->data(),
+                     stdex::extents<size_type, stdex::dynamic_extent, 7u>(get_nparts()));
+
+    // Load the particle radiuses.
+    const auto p_rad_i = sv(pi, 6);
+    const auto p_rad_j = sv(pj, 6);
+
+    // Cache the range of end times of the substeps.
+    const auto tcoords_begin_i = sd_i.tcoords.begin();
+    const auto tcoords_end_i = sd_i.tcoords.end();
+
+    const auto tcoords_begin_j = sd_j.tcoords.begin();
+    const auto tcoords_end_j = sd_j.tcoords.end();
+
+    // Determine, for both particles, the range of substeps
+    // that fully includes the current chunk.
+    // NOTE: same code as in sim_propagate.cpp.
+    const auto ss_it_begin_i = std::upper_bound(tcoords_begin_i, tcoords_end_i, chunk_begin);
+    auto ss_it_end_i = std::lower_bound(ss_it_begin_i, tcoords_end_i, chunk_end);
+    ss_it_end_i += (ss_it_end_i != tcoords_end_i);
+
+    const auto ss_it_begin_j = std::upper_bound(tcoords_begin_j, tcoords_end_j, chunk_begin);
+    auto ss_it_end_j = std::lower_bound(ss_it_begin_j, tcoords_end_j, chunk_end);
+    ss_it_end_j += (ss_it_end_j != tcoords_end_j);
+
+    // Iterate until we get to the end of at least one range.
+    // NOTE: if either range is empty, this loop is never entered.
+    // This should never happen, but see the comments in
+    // dense_propagate().
+    for (auto it_i = ss_it_begin_i, it_j = ss_it_begin_j; it_i != ss_it_end_i && it_j != ss_it_end_j;) {
+        // Initial time coordinates of the substeps of i and j,
+        // relative to init_time.
+        const auto ss_start_i = (it_i == tcoords_begin_i) ? hy::detail::dfloat<double>(0) : *(it_i - 1);
+        const auto ss_start_j = (it_j == tcoords_begin_j) ? hy::detail::dfloat<double>(0) : *(it_j - 1);
+
+        // Determine the intersections of the two substeps
+        // with the current chunk.
+        // NOTE: min/max is fine here: values in tcoords are always checked
+        // for finiteness, chunk_begin/end are also checked in
+        // get_chunk_begin_end().
+        const auto lb_i = std::max(chunk_begin, ss_start_i);
+        const auto ub_i = std::min(chunk_end, *it_i);
+        const auto lb_j = std::max(chunk_begin, ss_start_j);
+        const auto ub_j = std::min(chunk_end, *it_j);
+
+        // Determine the intersection between the two intervals
+        // we just computed. This will be the time range
+        // within which we need to do polynomial root finding.
+        // NOTE: at this stage lb_rf/ub_rf are still time coordinates wrt
+        // init_time.
+        // NOTE: min/max fine here, all quantities are safe.
+        const auto lb_rf = std::max(lb_i, lb_j);
+        const auto ub_rf = std::min(ub_i, ub_j);
+
+        // The Taylor polynomials for the two particles are time polynomials
+        // in which time is counted from the beginning of the substep. In order to
+        // create the polynomial representing the distance square, we need first to
+        // translate the polynomials of both particles so that they refer to a
+        // common time coordinate, the time elapsed from lb_rf.
+
+        // Compute the translation amount for the two particles.
+        const auto delta_i = static_cast<double>(lb_rf - ss_start_i);
+        const auto delta_j = static_cast<double>(lb_rf - ss_start_j);
+
+        // Compute the time interval within which we will be performing root finding.
+        const auto rf_int = static_cast<double>(ub_rf - lb_rf);
+
+        // Do some checking before moving on.
+        if (!std::isfinite(delta_i) || !std::isfinite(delta_j) || !std::isfinite(rf_int) || delta_i < 0 || delta_j < 0
+            || rf_int < 0) {
+            // LCOV_EXCL_START
+            // Bail out in case of errors.
+            logger->warn("During the narrow phase collision/conjunction detection of particles {} and {}, "
+                         "an invalid time interval for polynomial root finding was generated - the "
+                         "collision/conjunction will be skipped",
+                         pi, pj);
+
+            break;
+            // LCOV_EXCL_STOP
+        }
+
+        // Fetch pointers to the original Taylor polynomials for the two particles.
+        // NOTE: static_cast because:
+        // - we have verified during the propagation that we can safely compute
+        //   differences between iterators of tcoords vectors (see overflow checking in the
+        //   step() function), and
+        // - we know that there are multiple Taylor coefficients being recorded
+        //   for each time coordinate, thus the size type of the vector of Taylor
+        //   coefficients can certainly represent the size of the tcoords vectors.
+        const auto ss_idx_i = static_cast<tc_size_t>(it_i - tcoords_begin_i);
+        const auto ss_idx_j = static_cast<tc_size_t>(it_j - tcoords_begin_j);
+
+        const auto *poly_xi = &tcs_i(ss_idx_i, 0, 0);
+        const auto *poly_yi = &tcs_i(ss_idx_i, 1, 0);
+        const auto *poly_zi = &tcs_i(ss_idx_i, 2, 0);
+        // NOTE: need the velocities only for the conjunctions.
+        const auto *poly_vxi = pij_conj_active ? &tcs_i(ss_idx_i, 3, 0) : nullptr;
+        const auto *poly_vyi = pij_conj_active ? &tcs_i(ss_idx_i, 4, 0) : nullptr;
+        const auto *poly_vzi = pij_conj_active ? &tcs_i(ss_idx_i, 5, 0) : nullptr;
+
+        const auto *poly_xj = &tcs_j(ss_idx_j, 0, 0);
+        const auto *poly_yj = &tcs_j(ss_idx_j, 1, 0);
+        const auto *poly_zj = &tcs_j(ss_idx_j, 2, 0);
+        const auto *poly_vxj = pij_conj_active ? &tcs_j(ss_idx_j, 3, 0) : nullptr;
+        const auto *poly_vyj = pij_conj_active ? &tcs_j(ss_idx_j, 4, 0) : nullptr;
+        const auto *poly_vzj = pij_conj_active ? &tcs_j(ss_idx_j, 5, 0) : nullptr;
+
+        // Perform the translations, if needed.
+        // NOTE: perhaps we can write a dedicated function
+        // that does the translation for all 3 coordinates/velocities
+        // at once, for better performance?
+        // NOTE: need to re-assign the poly_*i pointers if the
+        // translation happens, otherwise we can keep the pointer
+        // to the original polynomials.
+        if (delta_i != 0) {
+            pta_cfunc(xi_temp.data(), poly_xi, &delta_i);
+            poly_xi = xi_temp.data();
+            pta_cfunc(yi_temp.data(), poly_yi, &delta_i);
+            poly_yi = yi_temp.data();
+            pta_cfunc(zi_temp.data(), poly_zi, &delta_i);
+            poly_zi = zi_temp.data();
+
+            if (pij_conj_active) {
+                pta_cfunc(vxi_temp.data(), poly_vxi, &delta_i);
+                poly_vxi = vxi_temp.data();
+                pta_cfunc(vyi_temp.data(), poly_vyi, &delta_i);
+                poly_vyi = vyi_temp.data();
+                pta_cfunc(vzi_temp.data(), poly_vzi, &delta_i);
+                poly_vzi = vzi_temp.data();
+            }
+        }
+
+        if (delta_j != 0) {
+            pta_cfunc(xj_temp.data(), poly_xj, &delta_j);
+            poly_xj = xj_temp.data();
+            pta_cfunc(yj_temp.data(), poly_yj, &delta_j);
+            poly_yj = yj_temp.data();
+            pta_cfunc(zj_temp.data(), poly_zj, &delta_j);
+            poly_zj = zj_temp.data();
+
+            if (pij_conj_active) {
+                pta_cfunc(vxj_temp.data(), poly_vxj, &delta_j);
+                poly_vxj = vxj_temp.data();
+                pta_cfunc(vyj_temp.data(), poly_vyj, &delta_j);
+                poly_vyj = vyj_temp.data();
+                pta_cfunc(vzj_temp.data(), poly_vzj, &delta_j);
+                poly_vzj = vzj_temp.data();
+            }
+        }
+
+        // Copy over the data to diff_input.
+        using di_size_t = decltype(diff_input.size());
+        std::copy(poly_xi, poly_xi + (order + 1u), diff_input.data());
+        std::copy(poly_yi, poly_yi + (order + 1u), diff_input.data() + (order + 1u));
+        std::copy(poly_zi, poly_zi + (order + 1u), diff_input.data() + static_cast<di_size_t>(2) * (order + 1u));
+        std::copy(poly_xj, poly_xj + (order + 1u), diff_input.data() + static_cast<di_size_t>(3) * (order + 1u));
+        std::copy(poly_yj, poly_yj + (order + 1u), diff_input.data() + static_cast<di_size_t>(4) * (order + 1u));
+        std::copy(poly_zj, poly_zj + (order + 1u), diff_input.data() + static_cast<di_size_t>(5) * (order + 1u));
+
+        // We can now construct the polynomial for the
+        // square of the distance.
+        auto *ss_diff_ptr = ss_diff.data();
+        pssdiff3_cfunc(ss_diff_ptr, diff_input.data(), nullptr);
+
+        // Remember the original constant term of the polynomial.
+        const auto orig_const_cf = ss_diff_ptr[0];
+
+        // Step 1: detect physical collision, if needed.
+        if (pi_coll_active || pj_coll_active) {
+            // Modify the constant term of the polynomial to account for
+            // particle sizes.
+            ss_diff_ptr[0] -= (p_rad_i + p_rad_j) * (p_rad_i + p_rad_j);
+
+            // Run polynomial root finding.
+            detail::run_poly_root_finding(ss_diff_ptr, order, rf_int, isol, wlist, fex_check, rtscc, pt1, pi, pj,
+                                          logger, -1, m_data->coll_vec, lb_rf, tmp, tmp1, tmp2, r_iso_cache);
+        }
+
+        // Step 2: do conjunction tracking, if needed.
+        if (pij_conj_active) {
+            // Restore the original constant term of the polynomial,
+            // which might have been modified by phyisical collision
+            // detection.
+            ss_diff_ptr[0] = orig_const_cf;
+
+            // Evaluate the dist2 polynomial in the [0, rf_int) interval.
+            const auto dist2_ieval = detail::poly_eval(ss_diff_ptr, detail::ival(0, rf_int), order);
+
+            if (!std::isfinite(dist2_ieval.lower) || !std::isfinite(dist2_ieval.upper)) {
+                // LCOV_EXCL_START
+                logger->warn("Non-finite value(s) detected during conjunction tracking for "
+                             "particles {} and {} - the conjunction will not be tracked",
+                             pi, pj);
+
+                break;
+                // LCOV_EXCL_STOP
+            }
+
+            if (dist2_ieval.lower < conj_thresh2) {
+                // The mutual distance between the particles might end up being
+                // less than the conjunction threshold during the current time interval.
+                // This means that a conjunction *may* happen.
+
+                // Compute the time derivative of the dist2 poly.
+                auto *ss_diff_der_ptr = ss_diff_der.data();
+                for (std::uint32_t i = 0; i < order; ++i) {
+                    ss_diff_der_ptr[i] = (i + 1u) * ss_diff_ptr[i + 1u];
+                }
+                // NOTE: the highest-order term needs to be set to zero manually.
+                ss_diff_der_ptr[order] = 0;
+
+                // Prepare tmp_conj_vec.
+                tmp_conj_vec.clear();
+
+                // Run polynomial root finding to detect conjunctions.
+                detail::run_poly_root_finding(ss_diff_der_ptr, order, rf_int, isol, wlist, fex_check, rtscc, pt1, pi,
+                                              pj, logger,
+                                              // NOTE: positive direction to detect only distance minima.
+                                              1, tmp_conj_vec,
+                                              // NOTE: invoke with lb_rf = 0 so that we get the
+                                              // conjunction time wrt the current time interval,
+                                              // rather than wrt the beginning of the superstep.
+                                              hy::detail::dfloat<double>(0.), tmp, tmp1, tmp2, r_iso_cache);
+
+                // For each detected conjunction, we need to:
+                // - verify that indeed the conjunction happens below
+                //   the threshold,
+                // - compute the conjunction distance and absolute
+                //   time coordinate.
+                for (const auto &[_1, _2, conj_tm] : tmp_conj_vec) {
+                    assert(_1 == pi);
+                    assert(_2 == pj);
+
+                    // Compute the conjunction distance square.
+                    const auto conj_dist2 = detail::poly_eval(ss_diff_ptr, conj_tm, order);
+
+                    if (!std::isfinite(conj_dist2)) {
+                        // LCOV_EXCL_START
+                        logger->warn("A non-finite conjunction distance square of {} was computed for the "
+                                     "particles at indices {} and {}, the conjunction will be ignored",
+                                     conj_dist2, pi, pj);
+                        continue;
+                        // LCOV_EXCL_STOP
+                    }
+
+                    if (conj_dist2 < conj_thresh2) {
+                        // Compute the state vector for the two particles.
+                        std::array<double, 6> pi_state = {
+                            detail::poly_eval(poly_xi, conj_tm, order),  detail::poly_eval(poly_yi, conj_tm, order),
+                            detail::poly_eval(poly_zi, conj_tm, order),  detail::poly_eval(poly_vxi, conj_tm, order),
+                            detail::poly_eval(poly_vyi, conj_tm, order), detail::poly_eval(poly_vzi, conj_tm, order)};
+
+                        std::array<double, 6> pj_state = {
+                            detail::poly_eval(poly_xj, conj_tm, order),  detail::poly_eval(poly_yj, conj_tm, order),
+                            detail::poly_eval(poly_zj, conj_tm, order),  detail::poly_eval(poly_vxj, conj_tm, order),
+                            detail::poly_eval(poly_vyj, conj_tm, order), detail::poly_eval(poly_vzj, conj_tm, order)};
+
+                        local_conj_vec.emplace_back(
+#if defined(__clang__)
+                            conjunction {
+#endif
+                                pi, pj,
+                                    // NOTE: we want to store here the absolute
+                                    // time coordinate of the conjunction. conj_tm
+                                    // is a time coordinate relative to the root
+                                    // finding interval, so we need to first refer it
+                                    // to the beginning of the superstep, and then,
+                                    // finally to the absolute time coordinate.
+                                    static_cast<double>(init_time + (lb_rf + conj_tm)),
+                                    // NOTE: conj_dist2 is finite but it could still
+                                    // be negative due to floating-point rounding
+                                    // (e.g., zero-distance conjunctions). Ensure
+                                    // we do not produce NaN here.
+                                    std::sqrt(std::max(conj_dist2, 0.)), pi_state, pj_state
+#if defined(__clang__)
+                            }
+#endif
+                        );
+                    } else {
+                        SPDLOG_LOGGER_DEBUG(logger, "Conjunction ignored because the conjunction "
+                                                    "distance is less than the threshold");
+                    }
+                }
+            }
+        }
+
+        // Update the substep iterators.
+        if (*it_i < *it_j) {
+            // The substep for particle i ends
+            // before the substep for particle j.
+            ++it_i;
+        } else if (*it_j < *it_i) {
+            // The substep for particle j ends
+            // before the substep for particle i.
+            ++it_j;
+        } else {
+            // Both substeps end at the same time.
+            // This happens at the last substeps of a chunk
+            // or in the very unlikely case in which both
+            // steps end exactly at the same time.
+            ++it_i;
+            ++it_j;
+        }
+    }
+}
+
 } // namespace cascade

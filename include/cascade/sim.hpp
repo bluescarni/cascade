@@ -29,6 +29,7 @@
 
 #include <fmt/core.h>
 
+#include <heyoka/detail/dfloat.hpp>
 #include <heyoka/detail/igor.hpp>
 #include <heyoka/expression.hpp>
 
@@ -181,6 +182,8 @@ private:
     template <typename T>
     CASCADE_DLL_LOCAL void compute_particle_aabb(unsigned, const T &, const T &, size_type);
     CASCADE_DLL_LOCAL std::vector<conjunction>::iterator append_conj_data(void *) noexcept;
+    CASCADE_DLL_LOCAL void narrow_phase_pair(void *, size_type, size_type, const heyoka::detail::dfloat<double> &,
+                                             const heyoka::detail::dfloat<double> &, void *);
 
     // Private delegating constructor machinery. This is used
     // in the generic constructor to move the initialisation of
